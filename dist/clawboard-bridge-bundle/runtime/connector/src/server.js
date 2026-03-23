@@ -9,16 +9,66 @@ const HOST = process.env.HOST || '0.0.0.0';
 const PORT = Number(process.env.PORT || 8787);
 const API_TOKEN = process.env.API_TOKEN || '';
 const STATE_FILE = process.env.STATE_FILE || '';
+const PERMISSION_PROFILE = process.env.PERMISSION_PROFILE || 'legacy';
+const PERMISSION_PROFILE_PATH = process.env.PERMISSION_PROFILE_PATH || '';
+const CAPABILITY_LEASES_FILE = process.env.CAPABILITY_LEASES_FILE || '';
+const RESTART_SIGNAL_FILE = process.env.RESTART_SIGNAL_FILE || '';
+
+function loadPermissionProfile() {
+  if (!PERMISSION_PROFILE_PATH) {
+    return {
+      profile_id: PERMISSION_PROFILE,
+      profile_title: 'Default Legacy Profile',
+      supports: {
+        directory_access: true,
+        command_alias: true,
+        restart: true
+      },
+      directory_policy: {
+        mode: 'allowlist-prefix',
+        allowed_prefixes: ['/tmp', '/var/tmp', '/data/releases']
+      },
+      command_aliases: {
+        git_status: { title: 'Git 状态检查', command_preview: 'git status --short' },
+        release_build: { title: 'Release 构建', command_preview: 'npm run build' },
+        restart_worker: { title: '重启 Worker', command_preview: 'systemctl restart lobster-worker' }
+      },
+      restart_action: RESTART_SIGNAL_FILE ? { type: 'signal_file', path: RESTART_SIGNAL_FILE } : null
+    };
+  }
+
+  try {
+    const raw = fs.readFileSync(PERMISSION_PROFILE_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    return parsed;
+  } catch (error) {
+    console.warn(`Failed to load permission profile from ${PERMISSION_PROFILE_PATH}: ${error.message}`);
+    return {
+      profile_id: PERMISSION_PROFILE,
+      profile_title: 'Fallback Profile',
+      supports: { directory_access: true, command_alias: false, restart: false },
+      directory_policy: { mode: 'allowlist-prefix', allowed_prefixes: ['/tmp'] },
+      command_aliases: {},
+      restart_action: null
+    };
+  }
+}
+
+const permissionProfile = loadPermissionProfile();
 
 const deviceInfo = {
   id: process.env.NODE_ID || 'node-local-1',
   name: process.env.CONNECTOR_NAME || os.hostname(),
   platform: process.env.PLATFORM || process.platform,
   connector_version: VERSION,
-  network_mode: process.env.NETWORK_MODE || 'direct'
+  network_mode: process.env.NETWORK_MODE || 'direct',
+  permission_profile: permissionProfile.profile_id || PERMISSION_PROFILE
 };
 
-const pairing = createPairingSession();
+const capabilityLeases = [];
+const commandAliases = permissionProfile.command_aliases || {};
+
+let pairing = createPairingSession();
 const issuedTokens = new Map();
 const eventClients = new Set();
 const eventLog = [];
@@ -72,6 +122,13 @@ function createPairingSession() {
     bridge_url: baseURL,
     pairing_link: pairingLink
   };
+}
+
+function getActivePairingSession() {
+  if (!pairing || isExpired(pairing.expires_at)) {
+    pairing = createPairingSession();
+  }
+  return pairing;
 }
 
 function createSeedState(nodeId) {
@@ -543,6 +600,95 @@ function getApprovalById(approvalId) {
   return state.approvals.find(approval => approval.id === approvalId);
 }
 
+function persistCapabilityLeases() {
+  if (!CAPABILITY_LEASES_FILE) return;
+  const payload = {
+    schema_version: 'clawboard.capability.leases.v1',
+    updated_at: isoNow(),
+    items: currentCapabilityLeases()
+  };
+  fs.mkdirSync(path.dirname(CAPABILITY_LEASES_FILE), { recursive: true });
+  fs.writeFileSync(CAPABILITY_LEASES_FILE, JSON.stringify(payload, null, 2));
+}
+
+function currentCapabilityLeases() {
+  const now = Date.now();
+  const active = capabilityLeases.filter(lease => Date.parse(lease.expires_at) > now);
+  if (active.length !== capabilityLeases.length) {
+    capabilityLeases.length = 0;
+    capabilityLeases.push(...active);
+    persistCapabilityLeases();
+  }
+  return active;
+}
+
+function createCapabilityLease({ approval, grantedScope, durationMinutes, capabilityKind }) {
+  const expiresAt = new Date(Date.now() + durationMinutes * 60 * 1000).toISOString();
+  const lease = {
+    id: `lease-${approval.id}`,
+    approval_id: approval.id,
+    lobster_id: approval.lobster_id,
+    task_id: approval.task_id,
+    capability_kind: capabilityKind,
+    granted_scope: grantedScope,
+    expires_at: expiresAt,
+    created_at: isoNow()
+  };
+  capabilityLeases.push(lease);
+  persistCapabilityLeases();
+  return lease;
+}
+
+function appendLobsterLog(lobster, message) {
+  if (!lobster) return;
+  lobster.recent_logs.unshift(message);
+  lobster.recent_logs = lobster.recent_logs.slice(0, 12);
+}
+
+function requestProfileRestart(reason, lobster, task) {
+  const action = permissionProfile.restart_action;
+  if (!action) return false;
+  try {
+    if (action.type === 'signal_file' && action.path) {
+      const resolved = path.isAbsolute(action.path) ? action.path : path.resolve(process.cwd(), action.path);
+      fs.mkdirSync(path.dirname(resolved), { recursive: true });
+      fs.writeFileSync(resolved, JSON.stringify({ reason, time: isoNow(), lobster_id: lobster?.id || null, task_id: task?.id || null }, null, 2));
+      return true;
+    }
+  } catch (error) {
+    console.warn(`Failed to request restart action: ${error.message}`);
+  }
+  return false;
+}
+
+function restartLobsterRuntime(lobster, task, reason = 'restart_requested') {
+  if (!lobster) return;
+  const restartIssued = requestProfileRestart(reason, lobster, task);
+  lobster.status = 'busy';
+  lobster.last_active_at = isoNow();
+  appendLobsterLog(lobster, restartIssued ? `runtime restart requested via profile (${reason})` : `runtime restarted via bridge (${reason})`);
+  if (task) {
+    task.status = 'running';
+    task.current_step = 'restart_runtime';
+    task.timeline.push({ step: 'restart_runtime', status: 'done' });
+  }
+  publishEvent('lobster.status.changed', {
+    lobster_id: lobster.id,
+    status: lobster.status,
+    task_id: task?.id || null,
+    action: 'restart'
+  });
+  if (task) {
+    publishEvent('task.progress.updated', {
+      task_id: task.id,
+      status: task.status,
+      progress: task.progress,
+      current_step: task.current_step,
+      source: reason
+    });
+  }
+}
+
 function lobsterDetail(lobster) {
   const currentTask = state.tasks.find(task => task.lobster_id === lobster.id && ['running', 'waiting_approval', 'paused', 'failed'].includes(task.status)) || null;
   return {
@@ -578,7 +724,7 @@ async function handler(req, res) {
   if (!ensureAuth(req, res)) return;
 
   if (req.method === 'GET' && pathname === '/pair/session') {
-    return sendJson(res, 200, pairing);
+    return sendJson(res, 200, getActivePairingSession());
   }
 
   if (req.method === 'POST' && pathname === '/pair/exchange') {
@@ -593,11 +739,13 @@ async function handler(req, res) {
       return invalidRequest(res, 'pair_code is required');
     }
 
-    if (isExpired(pairing.expires_at)) {
+    const activePairing = getActivePairingSession();
+
+    if (isExpired(activePairing.expires_at)) {
       return invalidRequest(res, 'pair code is invalid or expired', 'pair_code_invalid');
     }
 
-    if (body.pair_code !== pairing.pair_code) {
+    if (body.pair_code !== activePairing.pair_code) {
       return invalidRequest(res, 'pair code is invalid or expired', 'pair_code_invalid');
     }
 
@@ -670,7 +818,14 @@ async function handler(req, res) {
   if (req.method === 'GET' && pathname === '/device/info') {
     return sendJson(res, 200, {
       ...deviceInfo,
-      state_status: stateSourceStatus
+      state_status: stateSourceStatus,
+      permission_profile_title: permissionProfile.profile_title || null,
+      supported_capability_kinds: Object.entries(permissionProfile.supports || {})
+        .filter(([, enabled]) => Boolean(enabled))
+        .map(([key]) => key),
+      supported_command_aliases: Object.entries(commandAliases).map(([id, item]) => ({ id, ...item })),
+      directory_policy: permissionProfile.directory_policy || null,
+      active_capability_leases: currentCapabilityLeases()
     });
   }
 
@@ -852,12 +1007,40 @@ async function handler(req, res) {
       return invalidRequest(res, 'request body must be valid JSON');
     }
 
+    const durationMinutes = Math.max(1, Math.min(Number(body.duration_minutes) || 30, 240));
+    const grantedScope = body.granted_scope || approval.scope;
+    const capabilityKind = body.capability_kind === 'command_alias' ? 'command_alias' : 'directory_access';
+    const restartAfterGrant = Boolean(body.restart_after_grant);
+    const commandAlias = capabilityKind === 'command_alias' ? String(body.command_alias || '').trim() : null;
+
+    const allowedPrefixes = permissionProfile.directory_policy?.allowed_prefixes || [];
+
+    if (capabilityKind === 'command_alias' && (!commandAlias || !commandAliases[commandAlias])) {
+      return invalidRequest(res, 'command_alias must be one of the supported aliases');
+    }
+    if (capabilityKind === 'directory_access') {
+      const allowed = allowedPrefixes.length === 0 || allowedPrefixes.some(prefix => grantedScope === prefix || grantedScope.startsWith(`${prefix}/`));
+      if (!allowed) {
+        return invalidRequest(res, `granted_scope must stay within allowed prefixes: ${allowedPrefixes.join(', ') || '(none configured)'}`);
+      }
+    }
+
     approval.status = 'approved';
     approval.resolved_at = isoNow();
     approval.resolution = {
-      granted_scope: body.granted_scope || approval.scope,
-      duration_minutes: body.duration_minutes || 30
+      granted_scope: grantedScope,
+      duration_minutes: durationMinutes,
+      capability_kind: capabilityKind,
+      command_alias: commandAlias,
+      restart_after_grant: restartAfterGrant
     };
+
+    const lease = createCapabilityLease({
+      approval,
+      grantedScope,
+      durationMinutes,
+      capabilityKind
+    });
 
     const task = getTaskById(approval.task_id);
     if (task) {
@@ -870,7 +1053,10 @@ async function handler(req, res) {
     if (lobster) {
       lobster.status = 'busy';
       lobster.last_active_at = isoNow();
-      lobster.recent_logs.unshift(`approval ${approval.id} approved`);
+      const scopeText = capabilityKind === 'command_alias'
+        ? `command alias ${commandAlias}`
+        : `directory ${grantedScope}`;
+      appendLobsterLog(lobster, `temporary capability granted: ${scopeText} (${durationMinutes}m)`);
     }
 
     publishEvent('approval.resolved', {
@@ -878,7 +1064,11 @@ async function handler(req, res) {
       status: approval.status,
       task_id: approval.task_id,
       lobster_id: approval.lobster_id,
-      granted_scope: approval.resolution?.granted_scope || approval.scope
+      granted_scope: approval.resolution?.granted_scope || approval.scope,
+      capability_kind: capabilityKind,
+      command_alias: commandAlias,
+      lease_id: lease.id,
+      restart_after_grant: restartAfterGrant
     });
     if (task) {
       publishEvent('task.progress.updated', {
@@ -890,7 +1080,11 @@ async function handler(req, res) {
       });
     }
 
-    return sendJson(res, 200, controlResponse('approve', approval.id, { approval }));
+    if (restartAfterGrant) {
+      restartLobsterRuntime(lobster, task, 'temporary_capability_granted');
+    }
+
+    return sendJson(res, 200, controlResponse('approve', approval.id, { approval, capability_lease: lease }));
   }
 
   params = matchRoute(pathname, '/approvals/:id/reject');
@@ -952,6 +1146,19 @@ async function handler(req, res) {
     return sendJson(res, 200, controlResponse('reject', approval.id, { approval }));
   }
 
+  if (req.method === 'GET' && pathname === '/capabilities/leases') {
+    return sendJson(res, 200, { items: currentCapabilityLeases() });
+  }
+
+  params = matchRoute(pathname, '/lobsters/:id/restart');
+  if (req.method === 'POST' && params) {
+    const lobster = getLobsterById(params.id);
+    if (!lobster) return notFound(res, 'lobster');
+    const task = state.tasks.find(item => item.lobster_id === lobster.id && ['running', 'waiting_approval', 'paused', 'failed'].includes(item.status)) || null;
+    restartLobsterRuntime(lobster, task, 'operator_restart');
+    return sendJson(res, 200, controlResponse('restart', lobster.id));
+  }
+
   if (req.method === 'GET' && pathname === '/alerts') {
     return sendJson(res, 200, { items: state.alerts });
   }
@@ -977,7 +1184,8 @@ server.listen(PORT, HOST, () => {
     startStateFileWatcher(STATE_FILE);
   }
   console.log(`Clawboard Bridge listening on http://${HOST}:${PORT}`);
-  console.log(`Pair code: ${pairing.pair_code} (expires at ${pairing.expires_at})`);
+  const activePairing = getActivePairingSession();
+  console.log(`Pair code: ${activePairing.pair_code} (expires at ${activePairing.expires_at})`);
   if (STATE_FILE) {
     console.log(`External state file: ${path.resolve(STATE_FILE)}`);
   }
